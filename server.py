@@ -17,7 +17,8 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
+from collections.abc import AsyncGenerator
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -54,10 +55,10 @@ MAX_CACHE_TOKENS = 8192
 
 model: Optional["nn.Module"] = None
 tokenizer: Optional["TokenizerWrapper"] = None
-inference_semaphore: Optional[asyncio.Semaphore] = None
+inference_semaphore: "asyncio.Semaphore | None" = None
 
 # LRU KV Cache: conversation_id -> CacheEntry
-kv_cache_store: Optional["LRUKVCache"] = None
+kv_cache_store: "LRUKVCache | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -68,20 +69,27 @@ kv_cache_store: Optional["LRUKVCache"] = None
 class CacheEntry:
     """单条 KV cache 记录"""
 
-    def __init__(self, prompt_tokens: list[int], cache: list):
-        self.prompt_tokens = prompt_tokens  # 已处理的 token 序列
-        self.cache = cache  # MLX prompt_cache 对象
+    prompt_tokens: list[int]
+    cache: list[Any]
+    last_used: float
+
+    def __init__(self, prompt_tokens: list[int], cache: list[Any]):
+        self.prompt_tokens = prompt_tokens
+        self.cache = cache
         self.last_used = time.time()
 
 
 class LRUKVCache:
     """基于 LRU 策略的会话级 KV Cache 管理器"""
 
+    max_entries: int
+    _store: OrderedDict[str, CacheEntry]
+
     def __init__(self, max_entries: int = MAX_CACHE_ENTRIES):
         self.max_entries = max_entries
-        self._store: OrderedDict[str, CacheEntry] = OrderedDict()
+        self._store = OrderedDict()
 
-    def get(self, conversation_id: str) -> Optional[CacheEntry]:
+    def get(self, conversation_id: str) -> CacheEntry | None:
         """获取缓存并移到末尾（最近使用）"""
         if conversation_id in self._store:
             self._store.move_to_end(conversation_id)
@@ -90,13 +98,13 @@ class LRUKVCache:
             return entry
         return None
 
-    def put(self, conversation_id: str, prompt_tokens: list[int], cache: list):
+    def put(self, conversation_id: str, prompt_tokens: list[int], cache: list[Any]):
         """存入缓存，超出容量时淘汰最久未使用的"""
         if conversation_id in self._store:
             self._store.move_to_end(conversation_id)
         self._store[conversation_id] = CacheEntry(prompt_tokens, cache)
         while len(self._store) > self.max_entries:
-            evicted_key, evicted = self._store.popitem(last=False)
+            _, evicted = self._store.popitem(last=False)
             # 释放 MLX 内存
             del evicted.cache
 
@@ -129,7 +137,7 @@ class ChatRequest(BaseModel):
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     stream: bool = False
     # 扩展字段：传入 conversation_id 可复用 KV cache
-    conversation_id: Optional[str] = None
+    conversation_id: str | None = None
     # 控制是否使用 KV cache（默认开启）
     use_cache: bool = True
 
@@ -147,9 +155,9 @@ class ChoiceMessage(BaseModel):
 
 class Choice(BaseModel):
     index: int = 0
-    message: Optional[ChoiceMessage] = None
-    delta: Optional[dict] = None
-    finish_reason: Optional[str] = None
+    message: ChoiceMessage | None = None
+    delta: dict[str, Any] | None = None
+    finish_reason: str | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -158,7 +166,7 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[Choice]
-    usage: Optional[CompletionUsage] = None
+    usage: CompletionUsage | None = None
 
 
 class ModelInfo(BaseModel):
@@ -179,11 +187,12 @@ class ModelListResponse(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     global model, tokenizer, inference_semaphore, kv_cache_store
 
     print(f"🚀 Loading model from {MODEL_PATH} ...")
-    model, tokenizer = load(MODEL_PATH)
+    loaded = load(MODEL_PATH)
+    model, tokenizer = loaded[0], loaded[1]
     print("✅ Model loaded.")
 
     inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
@@ -222,12 +231,9 @@ def build_prompt(messages: list[ChatMessage]) -> str:
     """
     msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
 
-    if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
-        return tokenizer.apply_chat_template(
-            msg_dicts,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+    if tokenizer is not None and hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        return tokenizer.apply_chat_template(  # type: ignore[reportCallIssue, reportOptionalMemberAccess]
+            msg_dicts, add_generation_prompt=True, tokenize=False)
 
     # fallback: 手动拼接（Qwen 格式）
     prompt = ""
@@ -265,11 +271,16 @@ def find_common_prefix_length(a: list[int], b: list[int]) -> int:
 class CachePrepareResult:
     """prepare_cache_for_request 的返回结果"""
 
+    prompt_cache: list[Any] | None
+    prompt_for_generate: Any  # str 或 mx.array，传给 stream_generate 的 prompt
+    full_prompt_tokens: list[int]  # 完整 prompt 的 token ids（用于存回）
+    cache_hit: bool
+
     def __init__(
         self,
-        prompt_cache: Optional[list],
-        prompt_for_generate,  # str 或 mx.array，传给 stream_generate 的 prompt
-        full_prompt_tokens: list[int],  # 完整 prompt 的 token ids（用于存回）
+        prompt_cache: list[Any] | None,
+        prompt_for_generate: Any,
+        full_prompt_tokens: list[int],
         cache_hit: bool,
     ):
         self.prompt_cache = prompt_cache
@@ -280,7 +291,7 @@ class CachePrepareResult:
 
 def prepare_cache_for_request(
     prompt_text: str,
-    conversation_id: Optional[str],
+    conversation_id: str | None,
     use_cache: bool,
 ) -> CachePrepareResult:
     """
@@ -297,7 +308,13 @@ def prepare_cache_for_request(
         - full_prompt_tokens: 完整 prompt 的 token ids（存回用）
         - cache_hit: 是否命中了已有缓存
     """
-    full_prompt_tokens = tokenizer.encode(prompt_text)
+    # tokenizer 在 lifespan 阶段已初始化，请求处理时必定非 None
+    assert tokenizer is not None
+    # model 和 kv_cache_store 同理
+    assert model is not None
+    assert kv_cache_store is not None
+
+    full_prompt_tokens = tokenizer.encode(prompt_text)  # type: ignore[reportCallIssue]
 
     if not use_cache or not conversation_id:
         return CachePrepareResult(
@@ -312,10 +329,9 @@ def prepare_cache_for_request(
     if entry is None:
         # 首次请求：预创建空 cache 对象，stream_generate 会原地填充它
         cache = make_prompt_cache(model)
-        print(
-            f"  [KV Cache] MISS (first request) conversation={conversation_id}, "
-            f"prompt_tokens={len(full_prompt_tokens)}"
-        )
+        print("  [KV Cache] MISS (first request) conversation={}, prompt_tokens={}".format(
+            conversation_id, len(full_prompt_tokens)
+        ))
         return CachePrepareResult(
             prompt_cache=cache,
             prompt_for_generate=prompt_text,
@@ -356,11 +372,9 @@ def prepare_cache_for_request(
     # generate_step 会将这些 token 作为 cache 之后的新输入处理
     incremental_tokens = full_prompt_tokens[prefix_len:]
 
-    print(
-        f"  [KV Cache] HIT conversation={conversation_id}, "
-        f"reusing {prefix_len}/{len(full_prompt_tokens)} tokens, "
-        f"incremental={len(incremental_tokens)} tokens"
-    )
+    print("  [KV Cache] HIT conversation={}, reusing {}/{} tokens, incremental={} tokens".format(
+        conversation_id, prefix_len, len(full_prompt_tokens), len(incremental_tokens)
+    ))
 
     return CachePrepareResult(
         prompt_cache=cache,
@@ -413,13 +427,13 @@ async def stream_chat_sse(
 
     # 用 queue 桥接同步 stream_generate 和异步 SSE 生成器
     loop = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
     generation_done = asyncio.Event()
 
     def _run_generate():
         nonlocal prompt_tokens_count
         try:
-            kwargs = {
+            kwargs: dict[str, Any] = {
                 "max_tokens": req.max_tokens,
                 "sampler": sampler,
             }
@@ -427,33 +441,30 @@ async def stream_chat_sse(
                 kwargs["prompt_cache"] = cache_result.prompt_cache
 
             for response in stream_generate(
-                model,
-                tokenizer,
+                model,  # type: ignore[reportArgumentType]
+                tokenizer,  # type: ignore[reportArgumentType]
                 prompt=cache_result.prompt_for_generate,
                 **kwargs,
             ):
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    response,
-                )
+                loop.call_soon_threadsafe(queue.put_nowait, response)
                 prompt_tokens_count = response.prompt_tokens
         except Exception as e:
             loop.call_soon_threadsafe(queue.put_nowait, e)
         finally:
-            loop.call_soon_threadsafe(generation_done.set)
+            loop.call_soon_threadsafe(generation_done.set)  # type: ignore[operator]
 
     # 启动生成线程
-    loop.run_in_executor(None, _run_generate)
+    loop.run_in_executor(None, _run_generate)  # type: ignore[func-returns-none]
 
     while True:
         # 等待下一个 token 或生成结束
         try:
-            response = await asyncio.wait_for(queue.get(), timeout=QUEUE_TIMEOUT)
+            response: Any = await asyncio.wait_for(queue.get(), timeout=QUEUE_TIMEOUT)
         except asyncio.TimeoutError:
             break
 
         if isinstance(response, Exception):
-            error_chunk = {
+            error_chunk: dict[str, Any] = {
                 "error": {
                     "message": str(response),
                     "type": "server_error",
@@ -463,10 +474,10 @@ async def stream_chat_sse(
             break
 
         # 正常 token
-        completion_tokens_count = response.generation_tokens
-        full_response += response.text
+        completion_tokens_count: int = response.generation_tokens  # type: ignore[reportUnknownMemberType]
+        full_response += response.text  # type: ignore[reportUnknownMemberType]
 
-        chunk = {
+        chunk: dict[str, Any] = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
@@ -474,14 +485,14 @@ async def stream_chat_sse(
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"content": response.text},
-                    "finish_reason": response.finish_reason,
+                    "delta": {"content": response.text},  # type: ignore[reportUnknownMemberType]
+                    "finish_reason": response.finish_reason,  # type: ignore[reportUnknownMemberType]
                 }
             ],
         }
 
         # 最后一个 chunk 带 usage
-        if response.finish_reason is not None:
+        if response.finish_reason is not None:  # type: ignore[reportUnknownMemberType]
             # 使用完整 prompt tokens 数（stream_generate 报告的可能只是增量部分）
             actual_prompt_tokens = len(cache_result.full_prompt_tokens)
             chunk["usage"] = {
@@ -496,7 +507,7 @@ async def stream_chat_sse(
             break
 
     # 等待生成线程彻底结束
-    await generation_done.wait()
+    await generation_done.wait()  # type: ignore[func-returns-none]
 
     # Phase 3: 存回 KV cache
     if req.use_cache and req.conversation_id and cache_result.prompt_cache is not None:
@@ -506,7 +517,7 @@ async def stream_chat_sse(
         # 其中上一轮的 assistant 回复会带有 <|im_start|>assistant 等标记，
         # 和裸生成的 text tokens 不一致，所以只匹配 prompt 前缀
         if len(cache_result.full_prompt_tokens) <= MAX_CACHE_TOKENS:
-            kv_cache_store.put(
+            kv_cache_store.put(  # type: ignore[reportOptionalMemberAccess]
                 req.conversation_id,
                 cache_result.full_prompt_tokens,
                 cache_result.prompt_cache,
@@ -536,7 +547,7 @@ async def generate_chat_response(
     loop = asyncio.get_event_loop()
 
     def _sync_generate():
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "max_tokens": req.max_tokens,
             "sampler": sampler,
         }
@@ -548,14 +559,14 @@ async def generate_chat_response(
         completion_tokens = 0
 
         for response in stream_generate(
-            model,
-            tokenizer,
+            model,  # type: ignore[reportArgumentType]
+            tokenizer,  # type: ignore[reportArgumentType]
             prompt=cache_result.prompt_for_generate,
             **kwargs,
         ):
-            full_text += response.text
-            prompt_tokens = response.prompt_tokens
-            completion_tokens = response.generation_tokens
+            full_text += response.text  # type: ignore[reportUnknownMemberType]
+            prompt_tokens = response.prompt_tokens  # type: ignore[reportUnknownMemberType]
+            completion_tokens = response.generation_tokens  # type: ignore[reportUnknownMemberType]
 
         return full_text, prompt_tokens, completion_tokens
 
@@ -567,7 +578,7 @@ async def generate_chat_response(
     if req.use_cache and req.conversation_id and cache_result.prompt_cache is not None:
         # 只存 prompt tokens，不含生成内容（理由见 streaming 部分注释）
         if len(cache_result.full_prompt_tokens) <= MAX_CACHE_TOKENS:
-            kv_cache_store.put(
+            kv_cache_store.put(  # type: ignore[reportOptionalMemberAccess]
                 req.conversation_id,
                 cache_result.full_prompt_tokens,
                 cache_result.prompt_cache,
@@ -612,10 +623,13 @@ async def chat_completions(req: ChatRequest):
     completion_id = make_completion_id()
     prompt_text = build_prompt(req.messages)
 
+    # inference_semaphore 在 lifespan 阶段已初始化，必定非 None
+    assert inference_semaphore is not None
+
     # Phase 2: 并发控制 — 获取推理锁（带超时）
     try:
         await asyncio.wait_for(
-            inference_semaphore.acquire(),
+            inference_semaphore.acquire(),  # type: ignore[func-returns-none]
             timeout=QUEUE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -640,7 +654,7 @@ async def chat_completions(req: ChatRequest):
                     ):
                         yield chunk
                 finally:
-                    inference_semaphore.release()
+                    inference_semaphore.release()  # type: ignore[func-returns-none, reportOptionalMemberAccess]
 
             return StreamingResponse(
                 _stream_with_release(),
@@ -659,9 +673,9 @@ async def chat_completions(req: ChatRequest):
                 )
                 return result
             finally:
-                inference_semaphore.release()
+                inference_semaphore.release()  # type: ignore[func-returns-none, reportOptionalMemberAccess]
     except Exception:
-        inference_semaphore.release()
+        inference_semaphore.release()  # type: ignore[func-returns-none, reportOptionalMemberAccess]
         raise
 
 
