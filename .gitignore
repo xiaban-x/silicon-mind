@@ -1,0 +1,48 @@
+# AI / LLM
+.cache/
+*.ckpt
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+mlx_lm/
+llm/
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyi
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+ENV/
+env/
+.pip-cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.codebuddy/
+.cursor/
+.claude/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+*.log
