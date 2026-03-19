@@ -18,7 +18,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
-from typing import Any, Optional
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -53,8 +53,8 @@ MAX_CACHE_TOKENS = 8192
 # Global State
 # ---------------------------------------------------------------------------
 
-model: Optional["nn.Module"] = None
-tokenizer: Optional["TokenizerWrapper"] = None
+model: "nn.Module | None" = None
+tokenizer: "TokenizerWrapper | None" = None
 inference_semaphore: "asyncio.Semaphore | None" = None
 
 # LRU KV Cache: conversation_id -> CacheEntry
